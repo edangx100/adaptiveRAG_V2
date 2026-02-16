@@ -1,0 +1,10 @@
+anthropic==0.42.0
+claude-agent-sdk
+chromadb==0.4.22
+gradio==4.16.0
+python-dotenv==1.0.0
+httpx==0.26.0
+exa-py==1.0.8
+fastapi==0.109.0
+uvicorn[standard]==0.27.0
+pydantic>=2.6.0
