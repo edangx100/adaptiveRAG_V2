@@ -191,8 +191,55 @@ class RetrievalAgent:
             # permission_mode removed for production deployment
         )
 
-        # Initialize web search subagent (lazy loading to avoid circular imports)
-        self._web_search_agent = None
+        # Formal subagent pattern (SDK AgentDefinition):
+        # RetrievalAgent's Claude instance invokes WebSearchAgent via the "Agent" tool
+        # rather than calling it directly as a Python object. The MCP server for
+        # exa_web_search must be registered here so the subagent can access the tool
+        # when it runs inside this agent's session.
+        from agents.web_search_agent import exa_web_search, WebSearchAgent as _WebSearchAgent
+        self._web_search_mcp_server = create_sdk_mcp_server(
+            name="web_search_server",
+            tools=[exa_web_search]
+        )
+
+        # Structured output schema: ensures retrieve_from_web always gets a typed
+        # list back from the subagent instead of free-form text that needs parsing.
+        self._web_results_schema = {
+            "type": "object",
+            "properties": {
+                "documents": {
+                    "type": "array",
+                    "items": {
+                        "type": "object",
+                        "properties": {
+                            "document": {"type": "string"},
+                            "title": {"type": "string"},
+                            "source": {"type": "string"},
+                            "similarity_score": {"type": "number"},
+                            "collection": {"type": "string"}
+                        },
+                        "required": ["document", "source", "similarity_score", "collection"],
+                        # additionalProperties: True preserves extra fields (e.g. metadata)
+                        # returned by exa_tool without needing to enumerate them here.
+                        "additionalProperties": True
+                    }
+                }
+            },
+            "required": ["documents"],
+            "additionalProperties": False
+        }
+
+        # Separate options from self.agent_options: this session uses "Agent" (not
+        # chromadb_retriever), declares the web-search subagent, and enforces
+        # structured output so retrieve_from_web can return List[Dict] directly.
+        self.web_search_options = ClaudeAgentOptions(
+            system_prompt=self._get_system_prompt(),
+            mcp_servers={"web_search": self._web_search_mcp_server},
+            allowed_tools=["Agent"],  # "Agent" tool is required for subagent invocation
+            agents={"web-search": _WebSearchAgent.as_agent_definition()},
+            model=self.model,
+            output_format={"type": "json_schema", "schema": self._web_results_schema}
+        )
 
     def _get_system_prompt(self) -> str:
         """Get the system prompt for the retrieval agent."""
@@ -318,19 +365,6 @@ Use the chromadb_retriever tool to fetch the documents."""
             top_k=top_k
         )
 
-    @property
-    def web_search_agent(self):
-        """
-        Get the web search subagent (lazy loading).
-
-        Returns:
-            WebSearchAgent instance
-        """
-        if self._web_search_agent is None:
-            from agents.web_search_agent import WebSearchAgent
-            self._web_search_agent = WebSearchAgent(model=self.model)
-        return self._web_search_agent
-
     async def retrieve_from_web(
         self,
         query_text: str,
@@ -338,23 +372,54 @@ Use the chromadb_retriever tool to fetch the documents."""
         use_agent: bool = True
     ) -> List[Dict[str, Any]]:
         """
-        Retrieve documents from web search using the WebSearchAgent subagent.
+        Retrieve documents from web search using the WebSearchAgent formal subagent.
 
-        This method delegates web search to the WebSearchAgent subagent.
-        It's the preferred method for web-based retrieval in the orchestrator.
+        Uses the SDK AgentDefinition pattern: RetrievalAgent invokes WebSearchAgent
+        via the Agent tool, with structured output to extract the results.
 
         Args:
             query_text: The search query
             num_results: Number of web results to return
-            use_agent: If True, use agent reasoning; if False, direct call
+            use_agent: If True, invoke via formal subagent; if False, direct call
 
         Returns:
             List of web search results in standardized document format
         """
-        if use_agent:
-            return await self.web_search_agent.search_web(query_text, num_results)
-        else:
-            return await self.web_search_agent.search_web_direct(query_text, num_results)
+        if not use_agent:
+            # Bypass the subagent entirely — useful for unit tests and debugging.
+            from tools.exa_tool import search_web as _search_web
+            return _search_web(query_text, num_results=num_results)
+
+        from claude_agent_sdk import ClaudeSDKClient, ResultMessage
+
+        # The prompt tells the parent agent to delegate to "web-search" via the Agent tool.
+        # self.web_search_options registers that subagent, so Claude knows how to invoke it.
+        prompt = f"""Use the web-search subagent to find information about: "{query_text}"
+
+Retrieve {num_results} relevant results and return them as documents."""
+
+        result = None
+        try:
+            async with ClaudeSDKClient(options=self.web_search_options) as client:
+                await client.query(prompt)
+                # Collect the final ResultMessage, which carries structured_output
+                # populated from self._web_results_schema.
+                async for message in client.receive_response():
+                    if isinstance(message, ResultMessage):
+                        result = message
+        except Exception as e:
+            print(f"Error in web search subagent: {e}")
+            from tools.exa_tool import search_web as _search_web
+            return _search_web(query_text, num_results=num_results)
+
+        if result is None or not hasattr(result, 'structured_output') or result.structured_output is None:
+            print("Warning: web search subagent returned no structured output, falling back")
+            from tools.exa_tool import search_web as _search_web
+            return _search_web(query_text, num_results=num_results)
+
+        # structured_output is already validated against _web_results_schema,
+        # so documents is guaranteed to be a list of dicts with the required fields.
+        return result.structured_output.get('documents', [])
 
 
 # Convenience function for standalone usage
